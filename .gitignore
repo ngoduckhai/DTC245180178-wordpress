@@ -1,0 +1,5 @@
+.env
+nginx/certs/*
+!nginx/certs/.gitkeep
+*.log
+.DS_Store

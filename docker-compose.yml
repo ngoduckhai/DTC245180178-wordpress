@@ -1,0 +1,213 @@
+name: wordpress-devops
+
+services:
+  db:
+    image: mysql:8.4
+    user: "root"
+    container_name: wp-db
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Set MYSQL_ROOT_PASSWORD in .env}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-wordpress}
+      MYSQL_USER: ${MYSQL_USER:-wp_user}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in .env}
+      MYSQL_EXPORTER_PASSWORD: ${MYSQL_EXPORTER_PASSWORD:?Set MYSQL_EXPORTER_PASSWORD in .env}
+      TZ: ${TZ:-Asia/Ho_Chi_Minh}
+    volumes:
+      - db_data:/var/lib/mysql
+      - ./mysql/init:/docker-entrypoint-initdb.d:ro
+    networks: [backend-net]
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    security_opt:
+      - no-new-privileges:true
+
+  wordpress:
+    image: wordpress:php8.3-apache
+    container_name: wp-app
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      WORDPRESS_DB_HOST: db:3306
+      WORDPRESS_DB_NAME: ${MYSQL_DATABASE:-wordpress}
+      WORDPRESS_DB_USER: ${MYSQL_USER:-wp_user}
+      WORDPRESS_DB_PASSWORD: ${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in .env}
+      WORDPRESS_CONFIG_EXTRA: |
+        define('FORCE_SSL_ADMIN', true);
+        if (isset($$_SERVER['HTTP_X_FORWARDED_PROTO']) && $$_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') {
+          $$_SERVER['HTTPS'] = 'on';
+        }
+    volumes:
+      - wordpress_data:/var/www/html
+    networks: [frontend-net, backend-net]
+    security_opt:
+      - no-new-privileges:true
+
+  phpmyadmin:
+    image: phpmyadmin:5-apache
+    container_name: wp-phpmyadmin
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PMA_HOST: db
+      PMA_PORT: 3306
+      PMA_ABSOLUTE_URI: https://localhost:8443/dbadmin/
+      UPLOAD_LIMIT: 64M
+    networks: [frontend-net, backend-net]
+    security_opt:
+      - no-new-privileges:true
+
+  nginx:
+    image: nginx:1.28-alpine
+    container_name: wp-nginx
+    restart: unless-stopped
+    depends_on: [wordpress, phpmyadmin]
+    ports:
+      - "8081:80"
+      - "8443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+    networks: [frontend-net, monitoring-net]
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+      - /tmp
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: wp-cadvisor
+    restart: unless-stopped
+    privileged: true
+    devices:
+      - /dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+      - /dev/disk:/dev/disk:ro
+    networks: [monitoring-net]
+
+  node-exporter:
+    image: prom/node-exporter:v1.9.1
+    container_name: wp-node-exporter
+    restart: unless-stopped
+    command:
+      - --path.rootfs=/host
+      - --web.listen-address=:9100
+    pid: host
+    volumes:
+      - /:/host:ro
+    networks: [monitoring-net]
+
+  nginx-exporter:
+    image: nginx/nginx-prometheus-exporter:1.4.2
+    container_name: wp-nginx-exporter
+    restart: unless-stopped
+    command:
+      - --nginx.scrape-uri=http://nginx:8080/stub_status
+    depends_on: [nginx]
+    networks: [monitoring-net, frontend-net]
+
+  mysqld-exporter:
+    image: prom/mysqld-exporter:v0.17.2
+    container_name: wp-mysqld-exporter
+    restart: unless-stopped
+    environment:
+      MYSQLD_EXPORTER_PASSWORD: ${MYSQL_EXPORTER_PASSWORD:?Set MYSQL_EXPORTER_PASSWORD in .env}
+    command:
+      - --mysqld.address=db:3306
+      - --mysqld.username=exporter
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [backend-net, monitoring-net]
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    container_name: wp-prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    networks: [monitoring-net]
+    depends_on: [cadvisor, node-exporter, nginx-exporter, mysqld-exporter]
+    security_opt:
+      - no-new-privileges:true
+
+  grafana:
+    image: grafana/grafana:12.1.1
+    container_name: wp-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD in .env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_ROOT_URL: http://localhost:3001
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    networks: [frontend-net, monitoring-net]
+    depends_on: [prometheus, loki]
+    security_opt:
+      - no-new-privileges:true
+
+  loki:
+    image: grafana/loki:3.5.3
+    container_name: wp-loki
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/loki-config.yml"]
+    volumes:
+      - ./loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki_data:/loki
+    networks: [monitoring-net]
+    security_opt:
+      - no-new-privileges:true
+
+  promtail:
+    image: grafana/promtail:3.5.3
+    container_name: wp-promtail
+    restart: unless-stopped
+    command: ["-config.file=/etc/promtail/promtail-config.yml"]
+    volumes:
+      - ./promtail/promtail-config.yml:/etc/promtail/promtail-config.yml:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [monitoring-net]
+    depends_on: [loki]
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  frontend-net:
+    name: wordpress_frontend
+  backend-net:
+    name: wordpress_backend
+    internal: true
+  monitoring-net:
+    name: wordpress_monitoring
+    internal: true
+
+volumes:
+  wordpress_data:
+  db_data:
+  prometheus_data:
+  grafana_data:
+  loki_data:
