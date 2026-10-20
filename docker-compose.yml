@@ -44,6 +44,7 @@ services:
         }
     volumes:
       - wordpress_data:/var/www/html
+      - ./wordpress-theme:/var/www/html/wp-content/themes/aura-product:ro
     networks: [frontend-net, backend-net]
     security_opt:
       - no-new-privileges:true
